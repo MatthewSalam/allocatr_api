@@ -3,17 +3,19 @@ import uuid
 import shutil
 from datetime import datetime
 from typing import Optional, List
+from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, condecimal
+from pydantic import BaseModel
 from database import get_db
 from models import Receipt, Student, Allocation
 from api.dependencies import get_current_user, require_role
 
+load_dotenv()
 
-UPLOAD_DIR = "uploads/receipts"
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads/receipts")
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf"}
-MAX_FILE_SIZE_MB = 5
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "5"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -274,3 +276,4 @@ def cancel_receipt(
     db.commit()
 
     return {"detail": "Receipt cancelled and deleted successfully."}
+

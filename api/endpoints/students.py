@@ -10,6 +10,7 @@ from models import User, Student, Receipt, Allocation, Room, QRCode, Clearance
 from ..dependencies import require_role
 from services.qr_generator import generate_qr_code
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -174,23 +175,22 @@ def get_my_qr_code(
         qr_result = generate_qr_code(
             student_id=student_id,
             allocation_id=allocation.id,
-            db=db
         )
         
         logger.info(f"✓ QR code generated: {current_user.student.matric_number}")
         
         return {
-            "success": True,
-            "data": {
-                "qr_code": qr_result['qr_image_base64'],
-                "qr_data": qr_result['qr_data'],
-                "generated_at": qr_result['generated_at'],
-                "allocation": {
-                    "room": f"{allocation.room.block} - {allocation.room.room_number}",
-                    "academic_session": allocation.academic_session
+                "success": True,
+                "data": {
+                    "qr_code": qr_result['qr_image'],
+                    "qr_data": qr_result['qr_string'],
+                    "generated_at": datetime.utcnow(),
+                    "allocation": {
+                        "room": f"{allocation.room.block} - {allocation.room.room_number}",
+                        "academic_session": allocation.academic_session
+                    }
                 }
             }
-        }
         
     except Exception as e:
         logger.error(f"QR generation error: {e}")

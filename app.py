@@ -2,11 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db, test_database_connection
 import logging
-from api.endpoints import auth
-from api.endpoints import admin
-from api.endpoints import clearance
-from api.endpoints import receipts
-from api.endpoints import students
+from api.endpoints import auth, admin, clearance, receipts, students
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +15,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS - Allow frontend to connect
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production: ["https://yourfrontend.com"]
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

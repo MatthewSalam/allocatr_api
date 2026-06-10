@@ -7,6 +7,12 @@ from io import BytesIO
 from datetime import datetime
 import os
 import logging
+from dotenv import load_dotenv
+load_dotenv()
+
+QR_SECRET = os.getenv("QR_SECRET")
+if not QR_SECRET:
+    raise RuntimeError("QR_SECRET environment variable is not set")
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +42,7 @@ def generate_qr_code(student_id: int, allocation_id: int) -> dict:
     data_string = json.dumps(qr_data, sort_keys=True)
     # EXPLANATION: Convert dict to JSON string, sort_keys=True ensures same order always
     
-    secret_key = os.getenv("QR_SECRET")
+    secret_key = QR_SECRET
     
     signature = hmac.new(
         secret_key.encode(),  # Convert string to bytes
@@ -122,7 +128,7 @@ def verify_qr_code(qr_data_string: QRPayload) -> dict:
 
         # Step 3: Recalculate what signature SHOULD be
         data_string = json.dumps(qr_data, sort_keys=True)
-        secret_key = os.getenv("QR_SECRET")
+        secret_key = QR_SECRET
 
         expected_signature = hmac.new(
             secret_key.encode(),

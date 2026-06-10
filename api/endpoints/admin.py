@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -9,12 +10,15 @@ from models import User, Student, Receipt, Room, Allocation
 from ..dependencies import require_role
 from services.fcfs_allocator import FCFSAllocator
 import logging
+from fastapi.responses import FileResponse
+import mimetypes
+
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
-# ==================== SCHEMAS ====================
+#  SCHEMAS 
 
 class RoomCreateRequest(BaseModel):
     """Schema for creating a room"""
@@ -47,8 +51,7 @@ class RoomCreateRequest(BaseModel):
                         "status": "available"
                     }
                 }
-            ]
-        }
+            ]}
 
 class RoomUpdateRequest(BaseModel):
     """Schema for updating a room"""
@@ -111,7 +114,7 @@ class AllocateRoomsRequest(BaseModel):
             ]
         }
 
-# ==================== ROOM MANAGEMENT ENDPOINTS ====================
+#  ROOM MANAGEMENT ENDPOINTS 
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
 def create_room(
     room_data: RoomCreateRequest,
@@ -431,7 +434,6 @@ def delete_room(
             detail="Failed to delete room"
         )
 
-# ==================== RECEIPT MANAGEMENT ENDPOINTS ====================
 @router.get("/receipts/pending")
 def get_pending_receipts(
     limit: int = Query(50, ge=1, le=100),
@@ -609,57 +611,39 @@ def reject_receipt(
             detail="Failed to reject receipt"
         )
 
-# ==================== ALLOCATION ENDPOINTS ====================
-
+#  ALLOCATION ENDPOINTS 
 @router.post("/allocate")
 def allocate_rooms(
     allocation_data: AllocateRoomsRequest,
     current_user: User = Depends(require_role(['admin'])),
     db: Session = Depends(get_db)
 ):
-    """
-    Run FCFS room allocation
-    
-    **Requires:** Admin authentication
-    
-    **Process:**
-    1. Gets verified receipts (ordered by upload time - FCFS)
-    2. Allocates rooms based on gender and preferences
-    3. Generates QR codes for allocated students
-    
-    **Optional:** Filter by gender to allocate males/females separately
-    """
     logger.info(
         f"Room allocation triggered by {current_user.email} "
         f"for session {allocation_data.academic_session}"
     )
-    
+
     try:
         allocator = FCFSAllocator(db)
-        
+
         result = allocator.allocate_rooms(
             academic_session=allocation_data.academic_session,
             gender=allocation_data.gender
         )
-        
+
         logger.info(
             f"✓ Allocation completed: {result['allocated']}/{result['total_students']} students allocated"
         )
-        
-        return {
-            "success": True,
-            "message": "Room allocation completed successfully",
-            "data": result
-        }
-        
+
+        return result
+
     except Exception as e:
         logger.error(f"Allocation error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Allocation failed: {str(e)}"
         )
-
-
+        
 @router.get("/allocations")
 def get_all_allocations(
     academic_session: Optional[str] = None,
@@ -738,6 +722,8 @@ def get_system_status(
     current_user: User = Depends(require_role(['admin'])),
     db: Session = Depends(get_db)
 ):
+
+
     """
     Get overall system status for allocation readiness
     
@@ -792,3 +778,353 @@ def get_system_status(
             "allocation_ready": verified_receipts > 0 and available_rooms > 0
         }
     }
+
+@router.get("/me")
+def get_admin_info(
+    current_user: User = Depends(require_role(['admin'])),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current admin user information
+    
+    **Requires:** Admin authentication
+    
+    **Returns:** Admin profile with system stats
+    """
+    logger.info(f"Admin info requested by {current_user.email}")
+    
+    # Get basic stats for admin dashboard
+    total_students = db.query(Student).count()
+    total_receipts = db.query(Receipt).count()
+    pending_receipts = db.query(Receipt).filter(
+        Receipt.verification_status == 'pending'
+    ).count()
+    verified_receipts = db.query(Receipt).filter(
+        Receipt.verification_status == 'verified'
+    ).count()
+    total_rooms = db.query(Room).count()
+    total_allocations = db.query(Allocation).count()
+    
+    # Get total capacity and occupancy
+    total_capacity = db.query(func.sum(Room.capacity)).scalar() or 0
+    total_occupied = db.query(func.sum(Room.current_occupants)).scalar() or 0
+    
+    return {
+        "success": True,
+        "data": {
+            "user": {
+                "id": current_user.id,
+                "email": current_user.email,
+                "role": current_user.role,
+                "department": current_user.department,
+                "is_active": current_user.is_active,
+                "created_at": current_user.created_at
+            },
+            "quick_stats": {
+                "total_students": total_students,
+                "total_receipts": total_receipts,
+                "pending_receipts": pending_receipts,
+                "verified_receipts": verified_receipts,
+                "total_rooms": total_rooms,
+                "total_capacity": total_capacity,
+                "total_occupied": total_occupied,
+                "available_spaces": total_capacity - total_occupied,
+                "total_allocations": total_allocations,
+                "occupancy_percentage": int((total_occupied / total_capacity) * 100) if total_capacity > 0 else 0
+            }
+        }
+    }
+
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from io import BytesIO
+from datetime import datetime
+
+
+@router.get("/allocations/export/pdf")
+def export_allocations_pdf(
+    academic_session: str = Query(..., description="Academic session (e.g., 2025/2026)"),
+    current_user: User = Depends(require_role(['admin'])),
+    db: Session = Depends(get_db)
+):
+    """
+    Export all allocations as PDF
+    
+    **Requires:** Admin authentication
+    
+    **Query Parameters:**
+    - academic_session: Required (e.g., "2025/2026")
+    
+    **Returns:** PDF file download
+    """
+    logger.info(f"PDF export requested by {current_user.email} for session {academic_session}")
+    
+    # Get all allocations for the session
+    allocations_query = db.query(Allocation, Student, Room).join(
+        Student, Allocation.student_id == Student.id
+    ).join(
+        Room, Allocation.room_id == Room.id
+    ).filter(
+        Allocation.academic_session == academic_session
+    ).order_by(Room.block, Room.room_number, Student.full_name)
+    
+    allocations = allocations_query.all()
+    
+    if not allocations:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No allocations found for session {academic_session}"
+        )
+    
+    # Create PDF
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    elements = []
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        textColor=colors.HexColor('#2563EB'),
+        spaceAfter=30,
+        alignment=TA_CENTER
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=12,
+        textColor=colors.HexColor('#1F2937'),
+        spaceAfter=12
+    )
+    
+    # Title
+    title = Paragraph(f"Hostel Allocation Report<br/>Academic Session: {academic_session}", title_style)
+    elements.append(title)
+    
+    # Metadata
+    metadata = [
+        f"<b>Generated:</b> {datetime.now().strftime('%B %d, %Y at %I:%M %p')}",
+        f"<b>Total Allocations:</b> {len(allocations)}",
+        f"<b>Generated by:</b> {current_user.email}"
+    ]
+    
+    for meta in metadata:
+        elements.append(Paragraph(meta, styles['Normal']))
+    
+    elements.append(Spacer(1, 0.3 * inch))
+    
+    # Summary Statistics
+    male_count = sum(1 for a, s, r in allocations if s.gender == 'Male')
+    female_count = sum(1 for a, s, r in allocations if s.gender == 'Female')
+    
+    # Get unique blocks
+    blocks = {}
+    for allocation, student, room in allocations:
+        if room.block not in blocks:
+            blocks[room.block] = {'male': 0, 'female': 0}
+        if student.gender == 'Male':
+            blocks[room.block]['male'] += 1
+        else:
+            blocks[room.block]['female'] += 1
+    
+    summary_heading = Paragraph("Summary Statistics", heading_style)
+    elements.append(summary_heading)
+    
+    summary_data = [
+        ['Category', 'Count'],
+        ['Total Students Allocated', str(len(allocations))],
+        ['Male Students', str(male_count)],
+        ['Female Students', str(female_count)],
+        ['Total Blocks', str(len(blocks))]
+    ]
+    
+    summary_table = Table(summary_data, colWidths=[3 * inch, 2 * inch])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2563EB')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
+    ]))
+    
+    elements.append(summary_table)
+    elements.append(Spacer(1, 0.5 * inch))
+    
+    # Allocations Table
+    allocations_heading = Paragraph("Student Allocations", heading_style)
+    elements.append(allocations_heading)
+    
+    # Table headers
+    table_data = [
+        ['#', 'Matric Number', 'Student Name', 'Gender', 'Level', 'Room', 'Block']
+    ]
+    
+    # Table rows
+    for idx, (allocation, student, room) in enumerate(allocations, 1):
+        table_data.append([
+            str(idx),
+            student.matric_number,
+            student.full_name[:25] + '...' if len(student.full_name) > 25 else student.full_name,
+            student.gender,
+            student.level or 'N/A',
+            room.room_number,
+            room.block
+        ])
+    
+    # Create table
+    col_widths = [0.4 * inch, 1.2 * inch, 2.2 * inch, 0.7 * inch, 0.6 * inch, 0.8 * inch, 1 * inch]
+    allocations_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    
+    allocations_table.setStyle(TableStyle([
+        # Header style
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2563EB')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        
+        # Body style
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    elements.append(allocations_table)
+    
+    # Footer
+    elements.append(Spacer(1, 0.5 * inch))
+    footer = Paragraph(
+        f"<i>This is an official document generated by Allocatr - Hostel Management System</i>",
+        styles['Normal']
+    )
+    elements.append(footer)
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    
+    logger.info(f"✓ PDF generated: {len(allocations)} allocations")
+    
+    # Return as downloadable file
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=Allocations_{academic_session.replace('/', '-')}.pdf"
+        }
+    )
+
+@router.get("/rooms/{room_id}/diversity")
+def get_room_diversity_stats(
+    room_id: int,
+    current_user: User = Depends(require_role(['admin'])),
+    db: Session = Depends(get_db)
+):
+    """
+    Get diversity statistics for a specific room
+    
+    **Requires:** Admin authentication
+    
+    **Returns:** Level and department distribution in the room
+    """
+    room = db.query(Room).filter(Room.id == room_id).first()
+    
+    if not room:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Room not found"
+        )
+    
+    # Get students in this room
+    students = db.query(Student).join(Allocation).filter(
+        Allocation.room_id == room_id
+    ).all()
+    
+    # Level distribution
+    level_dist = {}
+    for student in students:
+        if student.level:
+            level_dist[student.level] = level_dist.get(student.level, 0) + 1
+    
+    # Department distribution
+    dept_dist = {}
+    for student in students:
+        if student.department:
+            dept_dist[student.department] = dept_dist.get(student.department, 0) + 1
+    
+    # Check if diversity rules are satisfied
+    level_violations = [level for level, count in level_dist.items() if count > 2]
+    dept_violations = [dept for dept, count in dept_dist.items() if count > 3]
+    
+    return {
+        "success": True,
+        "data": {
+            "room": {
+                "id": room.id,
+                "block": room.block,
+                "room_number": room.room_number,
+                "capacity": room.capacity,
+                "current_occupants": room.current_occupants
+            },
+            "diversity_stats": {
+                "level_distribution": level_dist,
+                "department_distribution": dept_dist,
+                "diversity_rules_satisfied": len(level_violations) == 0 and len(dept_violations) == 0,
+                "violations": {
+                    "levels_exceeding_max": level_violations,
+                    "departments_exceeding_max": dept_violations
+                }
+            },
+            "students": [
+                {
+                    "matric_number": s.matric_number,
+                    "full_name": s.full_name,
+                    "level": s.level,
+                    "department": s.department
+                }
+                for s in students
+            ]
+        }
+    }
+
+@router.get("/receipts/{receipt_id}/file")
+def get_receipt_file(
+    receipt_id: int,
+    current_user: User = Depends(require_role(['admin'])),
+    db: Session = Depends(get_db)
+):
+    receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+
+    if not os.path.exists(receipt.file_path):
+        raise HTTPException(status_code=404, detail="File not found on server")
+
+    # Derive media type from file name, fallback to stored value
+    media_type, _ = mimetypes.guess_type(receipt.file_name)
+    if not media_type:
+        media_type = receipt.file_type or "application/octet-stream"
+
+    return FileResponse(
+        path=receipt.file_path,
+        filename=receipt.file_name,
+        media_type=media_type
+    )
