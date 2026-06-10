@@ -94,8 +94,3 @@ Nigerian universities face significant challenges in hostel allocation and stude
 - **Version Control**: Git & GitHub
 - **Environment Management**: python-dotenv
 
----
-
-## 🏗 Architecture
-
-### **System Architecture**
